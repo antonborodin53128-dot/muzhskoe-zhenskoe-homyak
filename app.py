@@ -532,14 +532,13 @@ h2{margin:0 0 14px;font-size:17px;font-weight:600;color:var(--mist)}
 .fields input{width:100%;min-width:0;background:var(--ink-2);border:1px solid var(--line);border-radius:var(--r-s);color:var(--chalk);font:inherit;font-weight:600;padding:12px 14px}
 .fields input:focus{outline:2px solid var(--signal);outline-offset:1px}
 [hidden]{display:none!important}
-/* Хомяк: очки и буква рядом, кнопки «+1/−1» — только для поправки */
+/* Хомяк: очки и буква рядом */
 .duo{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px}
 .duo .box{background:var(--ink-2);border-radius:var(--r-m);padding:12px 8px 10px;text-align:center}
 .duo .num{font-size:64px;line-height:1.05;color:var(--signal)}
 .duo .cap{color:var(--mist);font-weight:600;font-size:14px;margin-top:2px}
 .duo .letter{color:var(--chalk)}
 .duo .letter.dim{color:var(--line)}
-.pad .plus{height:84px;font-size:32px}
 </style></head>
 <body>
 <div class="offline" id="offline">Нет связи с сервером — переподключаюсь…</div>
@@ -607,11 +606,6 @@ $('nameFields').addEventListener('keydown', e => { if (e.key === 'Enter') { e.pr
 $('reset').onclick = () => { if (confirm('Сбросить конкурс? Все результаты удалятся.')) socket.emit('reset'); };
 
 function act(name, data){ socket.emit(name, data || {}); }
-function scoreTap(delta){
-  if (!['play', 'timeup'].includes(phaseOf(S))) return;
-  if (navigator.vibrate) navigator.vibrate(delta > 0 ? 18 : [10, 40, 10]);
-  act('score', {delta});
-}
 /* Если к телефону/ноутбуку ведущего подключена клавиатура — буквы работают и здесь */
 document.addEventListener('keydown', e => {
   if (e.repeat || !S || e.target.closest('input') || e.ctrlKey || e.metaKey || e.altKey) return;
@@ -631,17 +625,14 @@ function renderActions(ph, isLast){
     a.innerHTML = `<div class="stack"><button class="btn primary" data-act="start_timer">Запустить время</button>
       <p class="hint">${S.prep} секунд отсчёта, потом ${S.round} секунд игры. Буквы нажимает участник на клавиатуре.</p></div>`;
   } else if (ph === 'countdown' || ph === 'play') {
-    a.innerHTML = `<div class="pad"><button class="plus" data-score="1" aria-label="Плюс одно очко">+1</button><button class="minus" data-score="-1" aria-label="Минус одно очко">−1</button></div>
-      <p class="hint" style="margin:10px 0 0">Очки считаются сами. Кнопки — только для поправки.</p>`;
+    a.innerHTML = `<p class="hint" style="margin:0">Очки считаются сами — участник жмёт буквы на клавиатуре.</p>`;
   } else if (ph === 'timeup') {
-    a.innerHTML = `<div class="pad" style="margin-bottom:10px"><button class="plus" data-score="1" aria-label="Плюс одно очко">+1</button><button class="minus" data-score="-1" aria-label="Минус одно очко">−1</button></div>
-      <p class="hint" style="margin:0 0 10px">Можно поправить счёт до перехода к следующему</p><div class="stack"><button class="btn primary" data-act="next">${isLast ? 'Показать итоги' : 'Следующий участник'}</button>
+    a.innerHTML = `<div class="stack"><button class="btn primary" data-act="next">${isLast ? 'Показать итоги' : 'Следующий участник'}</button>
       <button class="btn quiet" data-act="replay">Переиграть раунд</button></div>`;
   } else a.innerHTML = '';
 }
 $('actions').addEventListener('click', e => {
   const b = e.target.closest('button'); if (!b || b.disabled) return;
-  if (b.dataset.score) scoreTap(+b.dataset.score);
   if (b.dataset.act === 'replay' && !confirm('Обнулить счёт и переиграть раунд?')) return;
   if (b.dataset.act) act(b.dataset.act);
 });
@@ -675,7 +666,6 @@ function tick(){
       $('statusLabel').textContent = {ready:'Ждём старта', countdown:'Отсчёт', play:'Идёт время', timeup:'Время вышло'}[ph];
       setRoll($('time'), ph === 'countdown' ? String(Math.ceil(r)) : ph === 'timeup' ? '0:00' : fmtTime(r), {up: false});
       renderActions(ph, isLast);
-      document.querySelectorAll('[data-score]').forEach(b => b.disabled = ph === 'countdown');
     } else renderActions(ph, false);
     const done = ranking(S);
     $('results').hidden = !done.length;
@@ -776,6 +766,8 @@ body{background:radial-gradient(60% 70% at 50% 55%,var(--signal-soft),transparen
 @keyframes bad{0%,100%{transform:none}20%{transform:translateX(-3%);color:var(--danger)}40%{transform:translateX(3%);color:var(--danger)}60%{transform:translateX(-2%)}80%{transform:translateX(2%)}}
 /* плитка с буквой — строго по центру; очки прижаты к левому краю экрана, вровень с логотипом */
 .row{position:relative;display:grid;grid-template-columns:var(--tile);justify-content:center;align-items:center;width:100%;margin-top:1.5vh}
+.row .side{right:calc(-1 * (var(--side) + 2vw))}   /* у правого края экрана, по центру плитки — на одной высоте с очками */
+.play .who{transform:translateY(-3vh)}               /* имя участника чуть выше */
 .row .stat{position:absolute;left:calc(-1 * (var(--side) + 2vw));top:50%;transform:translateY(-50%);text-align:left;white-space:nowrap}
 .stat .count{font-size:min(7vw,12vh);margin:0}
 .stat .unit{margin-top:.5vh}
@@ -801,10 +793,10 @@ body{background:radial-gradient(60% 70% at 50% 55%,var(--signal-soft),transparen
       <div class="row">
         <div class="stat"><div class="count num" id="count"></div><div class="unit" id="unit">очков</div></div>
         <div class="letter num" id="letter">?</div>
+        <aside class="side"><div class="side-h">Результаты</div><div class="side-list" id="sideList"></div></aside>
       </div>
       <div class="timer" id="timer"></div>
     </div>
-    <aside class="side"><div class="side-h">Результаты</div><div class="side-list" id="sideList"></div></aside>
   </div>
 
   <div class="final" id="final" hidden><h1>Итоги</h1><div class="board" id="board"></div></div>
