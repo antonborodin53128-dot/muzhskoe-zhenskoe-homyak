@@ -765,7 +765,8 @@ body{background:radial-gradient(60% 70% at 50% 55%,var(--signal-soft),transparen
 .trow.win .pl{color:var(--signal-ink)}
 [hidden]{display:none!important}
 /* --- Хомяк: плитка с буквой, очки и таймер в одну строку --- */
-.letter{--tile:min(36vh,26vw);width:var(--tile);height:var(--tile);margin:1.5vh 0 0;display:flex;align-items:center;justify-content:center;
+.play{--tile:min(36vh,26vw)}
+.letter{width:var(--tile);height:var(--tile);margin:0;display:flex;align-items:center;justify-content:center;
   border-radius:var(--r-l);border:2px solid var(--line);background:rgba(13,38,27,.72);backdrop-filter:blur(2px);
   font-size:calc(var(--tile) * .78);line-height:1;color:var(--signal);filter:drop-shadow(0 0 40px var(--signal-soft));transition:opacity .3s,color .3s}
 .letter.dim{color:var(--mist);opacity:.5}
@@ -773,11 +774,13 @@ body{background:radial-gradient(60% 70% at 50% 55%,var(--signal-soft),transparen
 .letter.bad{animation:bad .4s}
 @keyframes pop{from{transform:scale(.8);opacity:.4}to{transform:none;opacity:1}}
 @keyframes bad{0%,100%{transform:none}20%{transform:translateX(-3%);color:var(--danger)}40%{transform:translateX(3%);color:var(--danger)}60%{transform:translateX(-2%)}80%{transform:translateX(2%)}}
-.stats{display:flex;align-items:center;justify-content:center;gap:3vw;margin-top:3vh;width:100%}
-.stat{text-align:center}
-.stat .count{font-size:min(9vw,15vh);margin:0}
+/* строка: [очки] [плитка] [пусто той же ширины] — плитка остаётся ровно по центру */
+.row{display:grid;grid-template-columns:minmax(0,1fr) var(--tile) minmax(0,1fr);align-items:center;width:100%;margin-top:1.5vh}
+.row .stat{grid-column:1;justify-self:end;margin-right:2.5vw;text-align:center;white-space:nowrap}
+.row .letter{grid-column:2}
+.stat .count{font-size:min(7vw,12vh);margin:0}
 .stat .unit{margin-top:.5vh}
-.stats .timer{margin-top:0;width:min(360px,20vw)}
+.play .timer{margin-top:2.2vh;width:var(--tile)}
 /* длинное имя в рейтинге заканчивается «…», а не обрезается посреди буквы */
 .srow .pn{display:block}
 .srow.now .pn:before{display:inline-block;margin-right:.5em;vertical-align:.04em}
@@ -796,11 +799,11 @@ body{background:radial-gradient(60% 70% at 50% 55%,var(--signal-soft),transparen
   <div class="play" id="game" hidden>
     <div class="game">
       <div class="who" id="who"></div>
-      <div class="letter num" id="letter">?</div>
-      <div class="stats">
+      <div class="row">
         <div class="stat"><div class="count num" id="count"></div><div class="unit" id="unit">очков</div></div>
-        <div class="timer" id="timer"></div>
+        <div class="letter num" id="letter">?</div>
       </div>
+      <div class="timer" id="timer"></div>
     </div>
     <aside class="side"><div class="side-h">Результаты</div><div class="side-list" id="sideList"></div></aside>
   </div>
