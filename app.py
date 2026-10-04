@@ -774,10 +774,9 @@ body{background:radial-gradient(60% 70% at 50% 55%,var(--signal-soft),transparen
 .letter.bad{animation:bad .4s}
 @keyframes pop{from{transform:scale(.8);opacity:.4}to{transform:none;opacity:1}}
 @keyframes bad{0%,100%{transform:none}20%{transform:translateX(-3%);color:var(--danger)}40%{transform:translateX(3%);color:var(--danger)}60%{transform:translateX(-2%)}80%{transform:translateX(2%)}}
-/* строка: [очки] [плитка] [пусто той же ширины] — плитка остаётся ровно по центру */
-.row{display:grid;grid-template-columns:minmax(0,1fr) var(--tile) minmax(0,1fr);align-items:center;width:100%;margin-top:1.5vh}
-.row .stat{grid-column:1;justify-self:end;margin-right:2.5vw;text-align:center;white-space:nowrap}
-.row .letter{grid-column:2}
+/* плитка с буквой — строго по центру; очки прижаты к левому краю экрана, вровень с логотипом */
+.row{position:relative;display:grid;grid-template-columns:var(--tile);justify-content:center;align-items:center;width:100%;margin-top:1.5vh}
+.row .stat{position:absolute;left:calc(-1 * (var(--side) + 2vw));top:50%;transform:translateY(-50%);text-align:left;white-space:nowrap}
 .stat .count{font-size:min(7vw,12vh);margin:0}
 .stat .unit{margin-top:.5vh}
 .play .timer{margin-top:2.2vh;width:var(--tile)}
