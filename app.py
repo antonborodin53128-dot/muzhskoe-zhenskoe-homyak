@@ -433,9 +433,9 @@ const Bg = (() => {
     ctx.restore();
   }
 
-  const faces = Array.from({length: 16}, () => ({
+  const faces = Array.from({length: 9}, () => ({
     x: Math.random(), y: Math.random(), r: 26 + Math.random() * 64,
-    v: .012 + Math.random() * .022, a: .10 + Math.random() * .14,
+    v: .012 + Math.random() * .022, a: .07 + Math.random() * .08,
     w: Math.random() * 6, rot: (Math.random() - .5) * .6, rs: .25 + Math.random() * .4,
   }));
 
@@ -445,10 +445,10 @@ const Bg = (() => {
       const fade = Math.min(1, y * 10, (1 - y) * 10);               // у краёв плавно появляются и исчезают
       const px = (f.x + Math.sin(t * .3 + f.w) * .02) * W, py = y * H * 1.15 - H * .07;
       const r = f.r * k * (1 + flash * .16), rot = f.rot + Math.sin(t * f.rs + f.w) * .18;
-      const a = (f.a + flash * .2) * fade;
+      const a = (f.a + flash * .14) * fade;
       // мягкое свечение позади — как огоньки в «Шариках»
       const g = ctx.createRadialGradient(px, py, 0, px, py, r * 1.6);
-      g.addColorStop(0, rgba((f.a * .4 + flash * .1) * fade)); g.addColorStop(1, rgba(0));
+      g.addColorStop(0, rgba((f.a * .35 + flash * .07) * fade)); g.addColorStop(1, rgba(0));
       ctx.globalCompositeOperation = 'lighter'; ctx.fillStyle = g;
       ctx.beginPath(); ctx.arc(px, py, r * 1.6, 0, Math.PI * 2); ctx.fill();
       ctx.globalCompositeOperation = 'source-over';
