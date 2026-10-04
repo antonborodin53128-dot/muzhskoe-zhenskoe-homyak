@@ -767,7 +767,7 @@ body{background:radial-gradient(60% 70% at 50% 55%,var(--signal-soft),transparen
 /* плитка с буквой — строго по центру; очки прижаты к левому краю экрана, вровень с логотипом */
 .row{position:relative;display:grid;grid-template-columns:var(--tile);justify-content:center;align-items:center;width:100%;margin-top:1.5vh}
 .row .side{right:calc(-1 * (var(--side) + 2vw))}   /* у правого края экрана, по центру плитки — на одной высоте с очками */
-.play .who{transform:translateY(-3vh)}               /* имя участника чуть выше */
+/* имя участника — посередине между верхним краем экрана и плиткой с буквой (см. placeWho) */
 .row .stat{position:absolute;left:calc(-1 * (var(--side) + 2vw));top:50%;transform:translateY(-50%);text-align:left;white-space:nowrap}
 .stat .count{font-size:min(7vw,12vh);margin:0}
 .stat .unit{margin-top:.5vh}
@@ -976,6 +976,19 @@ document.addEventListener('keydown', e => {
   }
 });
 
+/* Имя ровно посередине между верхним краем экрана и плиткой с буквой */
+let whoDy = 0;
+function placeWho(){
+  const el = $('who'), w = el.getBoundingClientRect(), t = document.querySelector('.row').getBoundingClientRect();   // строка не анимируется, в отличие от самой плитки
+  if (!t.height) return;
+  const off = t.top / 2 - (w.top + w.bottom) / 2;
+  if (Math.abs(off) < .5) return;
+  whoDy += off; el.style.transform = `translateY(${whoDy.toFixed(1)}px)`;
+}
+addEventListener('resize', () => { if (!$('game').hidden) { fitWho(); placeWho(); } });
+
+if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => { if (!$('game').hidden) { fitWho(); placeWho(); } });
+
 function frame(){
   if (S) {
     const ph = phaseOf(S), p = S.participants[S.current];
@@ -1005,6 +1018,7 @@ function frame(){
       renderLetter(ph);
       renderTimer(ph);
       renderSide();
+      placeWho();
     }
   }
   requestAnimationFrame(frame);
