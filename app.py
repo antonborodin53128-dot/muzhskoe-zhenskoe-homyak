@@ -45,6 +45,8 @@ state = {
     "wrong": 0,           # счётчик промахов, чтобы экран знал, когда трясти букву
     "bump": 0,            # счётчик изменений очков
     "diag": False,        # диагностика задержек на экранах (включается с пульта)
+    "judge": None,        # кто судит текущий раунд: id экрана (буквы считает он сам) или "server"
+    "judge_seq": 0,       # номер последнего отчёта судьи — запоздавшие отчёты не откатывают счёт
 }
 
 
@@ -74,10 +76,15 @@ def snapshot_locked():
         "wrong": state["wrong"],
         "bump": state["bump"],
         "diag": state["diag"],
+        "judge": state["judge"],
+        "screens": len(screens),
         "prep": PREP_SECONDS,
         "round": ROUND_SECONDS,
         "server_now": time.time(),
     }
+
+
+screens = {}   # открытые экраны для гостей: sid соединения -> {"id": id страницы, "t": когда подключился}
 
 
 def broadcast_locked():
@@ -126,7 +133,7 @@ def on_setup(data=None):
     with lock:
         state.update(
             participants=[{"name": f"Участник {i + 1}", "score": 0, "done": False} for i in range(count)],
-            current=0, finished=False, started_at=None, letter=None, wrong=0,
+            current=0, finished=False, started_at=None, letter=None, wrong=0, judge=None, judge_seq=0,
         )
         state["bump"] += 1
         broadcast_locked()
@@ -137,6 +144,7 @@ def on_start_timer(data=None):
     with lock:
         if phase_locked() == "ready":
             state["letter"] = pick_letter(None)
+            state.update(judge=None, judge_seq=0)
             state["started_at"] = time.time()
             broadcast_locked()
 
@@ -154,6 +162,7 @@ def apply_key_locked(letter, seen=None):
     seen = str(seen or "").upper()
     if seen and seen != state["letter"]:
         return "skip"
+    state["judge"] = "server"
     if letter == state["letter"]:
         player["score"] += 1
         state["letter"] = pick_letter(letter)
@@ -166,13 +175,85 @@ def apply_key_locked(letter, seen=None):
     return result
 
 
+def route_key_locked(letter, seen=None):
+    """Буква со страницы, где нет судьи (пульт, лаунчер, меню). Если открыт экран для гостей — отдаём букву ему:
+    он судья и засчитает её у себя мгновенно. Экрана нет — засчитывает сервер, как раньше."""
+    letter = str(letter or "").upper()
+    if len(letter) != 1 or letter not in LETTERS:
+        return "bad"
+    if not current_player_locked() or phase_locked() != "play":
+        return "off"
+    target = None
+    if screens:
+        judge_sids = [sid for sid, sc in screens.items() if sc["id"] == state["judge"]] or list(screens)
+        target = max(judge_sids, key=lambda sid: screens[sid]["t"])        # самое свежее соединение
+    if target:
+        msg = {"letter": letter}
+        seen = str(seen or "").upper()
+        if len(seen) == 1 and seen in LETTERS:
+            msg["seen"] = seen                     # какую букву видел нажавший: опоздавший повтор не промах
+        socketio.emit("remote_key", msg, to=target)
+        return "sent"
+    return apply_key_locked(letter, seen)
+
+
+@socketio.on("hello")
+def on_hello(data=None):
+    """Экран для гостей сообщает о себе: буквы с других страниц пойдут к нему."""
+    d = payload(data)
+    if d.get("role") != "screen":
+        return
+    page_id = str(d.get("id") or "")[:40]
+    with lock:
+        for sid in [sid for sid, sc in screens.items() if sc["id"] == page_id]:
+            del screens[sid]                       # тот же экран переподключился: старое соединение уже мёртвое
+        screens[request.sid] = {"id": page_id, "t": time.time()}
+        broadcast_locked()
+
+
+@socketio.on("disconnect")
+def on_disconnect(*args):
+    with lock:
+        if screens.pop(request.sid, None) is not None:
+            broadcast_locked()
+
+
+@socketio.on("progress")
+def on_progress(data=None):
+    """Отчёт судьи (экрана): счёт, текущая буква и промахи. Сервер только записывает и рассылает пульту и таблице."""
+    t0 = perf_counter()
+    d = payload(data)
+    judge = str(d.get("judge") or "")[:40]
+    letter = str(d.get("letter") or "").upper()
+    try:
+        rnd, seq, score, wrong = float(d.get("round")), int(d.get("seq")), int(d.get("score")), int(d.get("wrong"))
+    except (TypeError, ValueError):
+        return {"ok": False}
+    if not judge or judge == "server" or len(letter) != 1 or letter not in LETTERS or not 0 <= score <= 100000 or not 0 <= wrong <= 1000000 or seq < 1:
+        return {"ok": False}
+    with lock:
+        player = current_player_locked()
+        if not player or state["finished"] or state["started_at"] is None or abs(state["started_at"] - rnd) > 1e-3:
+            return {"ok": False}                       # отчёт о другом раунде (уже «Следующий участник» / «Переиграть»)
+        if state["judge"] == judge and seq <= state["judge_seq"]:
+            return {"ok": True}                        # запоздавший отчёт: свежий уже учтён
+        if state["judge"] not in (None, judge, "server") and state["judge"] in {sc["id"] for sc in screens.values()}:
+            return {"ok": False, "why": "judge"}       # раунд уже судит другой открытый экран
+        if player["score"] != score:
+            state["bump"] += 1
+        state.update(judge=judge, judge_seq=seq, letter=letter, wrong=wrong)
+        player["score"] = score
+        broadcast_locked()
+    return {"ok": True, "srv": round((perf_counter() - t0) * 1000, 2)}
+
+
 @socketio.on("key")
 def on_key(data=None):
     t0 = perf_counter()
     data = payload(data)
     with lock:
         t1 = perf_counter()
-        result = apply_key_locked(data.get("letter", ""), data.get("seen"))
+        result = route_key_locked(data.get("letter", ""), data.get("seen"))
     t2 = perf_counter()
     # ответ клиенту (для диагностики): сколько ждали блокировку и сколько всего занял сервер
     return {"r": result, "wait": round((t1 - t0) * 1000, 2), "srv": round((t2 - t0) * 1000, 2)}
@@ -250,7 +331,7 @@ def on_replay(data=None):
         player = current_player_locked()
         if player and not state["finished"]:
             player.update(score=0, done=False)
-            state.update(started_at=None, letter=None)
+            state.update(started_at=None, letter=None, judge=None, judge_seq=0)
             state["bump"] += 1
             broadcast_locked()
 
@@ -266,7 +347,7 @@ def on_next(data=None):
             state["current"] += 1
         else:
             state["finished"] = True
-        state.update(started_at=None, letter=None)
+        state.update(started_at=None, letter=None, judge=None, judge_seq=0)
         broadcast_locked()
 
 
@@ -287,7 +368,7 @@ def on_rename(data=None):
 @socketio.on("reset")
 def on_reset(data=None):
     with lock:
-        state.update(participants=[], current=-1, finished=False, started_at=None, letter=None, wrong=0)
+        state.update(participants=[], current=-1, finished=False, started_at=None, letter=None, wrong=0, judge=None, judge_seq=0)
         state["bump"] += 1
         broadcast_locked()
 
@@ -316,7 +397,7 @@ def api_key():
     """Буква с другой страницы сборника (лаунчер, меню, единый экран): там нет своего соединения с Хомяком."""
     data = request.get_json(silent=True)
     with lock:
-        apply_key_locked(payload(data).get("letter", ""))
+        route_key_locked(payload(data).get("letter", ""))
     return ("", 204)
 
 
@@ -549,15 +630,71 @@ const Bg = (() => {
   return { pulse(){ flashTarget = 1; }, recolor: readColor };
 })();
 
-/* Нажатие буквы: на сервер по уже открытому соединению. Через эту же функцию единый гостевой экран
-   сборника передаёт буквы в Хомяка, открытого у него внутри. */
-function pressKey(letter){
-  if (!S || !socket.connected || phaseOf(S) !== 'play') return false;
+/* ---------- Нажатие буквы: игра идёт на экране ----------
+   Судья раунда — экран для гостей: он сам проверяет букву, сразу показывает новую, прибавляет очко и
+   отправляет счёт на сервер (а тот — пульту и таблице). Сервер ничего не перепроверяет и не откатывает.
+   Буквы с других страниц (пульт, лаунчер, меню) сервер передаёт экрану-судье. Если экран не открыт,
+   судит страница, где нажали (пульт). Единый гостевой экран сборника передаёт буквы сюда же — в pressKey. */
+const LETTERS = 'ABCDEFGHIJKLMNPQRSTUVWXYZ';            // без O: она похожа на ноль
+const IS_SCREEN = !!document.getElementById('sideList');  // таблица справа есть только на экране для гостей
+// номер вкладки переживает перезагрузку страницы: перезагруженный экран остаётся тем же судьёй
+const PAGE_ID = (() => {
+  const fresh = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
+  try { let v = sessionStorage.getItem('hamsterPage'); if (!v) { v = fresh(); sessionStorage.setItem('hamsterPage', v); } return v; }
+  catch (e) { return fresh(); }
+})();
+let reportSeq = Date.now();   // номера отчётов растут и после перезагрузки — сервер не примет их за запоздавшие
+let J = null;   // местный судья: {round, player, score, letter, wrong, seq, acked}
+socket.on('connect', () => { if (IS_SCREEN) socket.emit('hello', {role: 'screen', id: PAGE_ID}); });
+function nextLetter(prev){ let c; do { c = LETTERS[Math.floor(Math.random() * LETTERS.length)]; } while (c === prev); return c; }
+function judging(){ return !!(J && S && S.started_at === J.round && S.current === J.player); }
+function applyJudge(){                       // своё — поверх снимка сервера: экран показывает то, что насчитал сам
+  if (!judging()) return;
+  const p = S.participants[S.current]; if (p) p.score = J.score;
+  S.letter = J.letter; S.wrong = J.wrong;
+}
+socket.on('state', () => {
+  if (!J) return;
+  if (!judging() || (J.acked && S.judge && S.judge !== PAGE_ID)) { J = null; return; }   // новый раунд или судит уже другой
+  applyJudge();
+});
+let relayRound = null;   // раунд, который судит другой экран: свои нажатия отдаём ему через сервер
+function judgeKey(letter, seen, remote){
+  if (!S || letter.length !== 1 || !LETTERS.includes(letter)) return false;   // O и прочее — не в игре
+  const ph = phaseOf(S);
+  // буква от сервера уже проверена им на «идёт игра»; часы экрана могут отставать на доли секунды
+  if (ph !== 'play' && !(remote && ph === 'countdown' && remaining(S) < .6)) return false;
+  const p = S.participants[S.current]; if (!p) return false;
+  if (!remote && relayRound === S.started_at && socket.connected) { socket.emit('key', {letter, seen: S.letter}); return true; }
+  if (seen && seen !== S.letter) return false;   // нажавший видел уже сменившуюся букву — это не промах
   const t0 = performance.now();
-  Diag.pressed(t0);
-  socket.emit('key', {letter, seen: S.letter}, r => Diag.answered(t0, r));   // seen: какая буква была на экране в момент нажатия
+  if (!judging()) J = {round: S.started_at, player: S.current, score: p.score, letter: S.letter, wrong: S.wrong, seq: 0, acked: false};
+  if (letter === J.letter) { J.score++; J.letter = nextLetter(J.letter); } else J.wrong++;
+  J.seq = ++reportSeq;
+  applyJudge();
+  Diag.pressed(t0, 'local'); Diag.drawn(t0);
+  const j = J;
+  socket.emit('progress', {judge: PAGE_ID, round: j.round, seq: j.seq, score: j.score, letter: j.letter, wrong: j.wrong},
+              r => {
+                if (r && r.ok) j.acked = true;
+                else if (r && r.why === 'judge' && J === j) { J = null; relayRound = j.round; socket.emit('sync'); }   // судит другой экран
+                Diag.answered(t0, r);
+              });
   return true;
 }
+function pressKey(letter){
+  if (!S || phaseOf(S) !== 'play') return false;
+  if (IS_SCREEN || !S.screens) return judgeKey(letter);   // экран судит сам; пульт — если экрана нет
+  if (!socket.connected) {                                   // нет соединения — обычным запросом, чтобы буква не потерялась
+    fetch(BASE + 'api/key', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({letter}), keepalive: true}).catch(() => {});
+    return true;
+  }
+  const t0 = performance.now();
+  Diag.pressed(t0, 'relay');
+  socket.emit('key', {letter, seen: S.letter}, r => Diag.answered(t0, r));   // пульт: букву засчитает экран
+  return true;
+}
+socket.on('remote_key', d => { if (IS_SCREEN && d && typeof d.letter === 'string') judgeKey(d.letter.toUpperCase(), typeof d.seen === 'string' ? d.seen : null, true); });
 
 /* ---------- Диагностика задержек ----------
    Включается клавишей F2 (на этой странице) или кнопкой «Диагностика» на пульте (сразу на всех экранах).
@@ -578,9 +715,9 @@ const Diag = (() => {
   }
   function finish(p){
     if (p.done || p.rtt == null) return;
-    if ((p.r === 'hit' || p.r === 'miss') && (p.paint === null || p.paint < 0)) return;   // ждём, когда кадр нарисуется
+    if ((p.mode === 'local' || p.r === 'hit' || p.r === 'miss' || p.r === 'sent') && (p.paint === null || p.paint < 0)) return;   // ждём, когда кадр нарисуется
     p.done = true; presses.push(p); if (presses.length > 200) presses.shift();
-    if (p.rtt > SLOW || (p.paint || 0) > SLOW) report({kind: 'press', rtt: p.rtt, srv: p.srv, wait: p.wait, paint: p.paint});
+    if ((p.paint || 0) > SLOW || p.rtt > (p.mode === 'local' ? 1000 : SLOW)) report({kind: 'press', rtt: p.rtt, srv: p.srv, wait: p.wait, paint: p.paint});
   }
   // кадры: большой разрыв между кадрами = экран «подвис» сам
   (function loop(t){
@@ -603,7 +740,7 @@ const Diag = (() => {
     });
   }, 2000);
   socket.on('state', () => {             // первый снимок после нажатия — это его результат
-    const p = pending.find(x => x.paint === null && x.r !== 'skip' && x.r !== 'off' && x.r !== 'bad');
+    const p = pending.find(x => x.mode === 'relay' && x.paint === null && x.r !== 'skip' && x.r !== 'off' && x.r !== 'bad');
     if (!p) return;
     p.paint = -1;
     requestAnimationFrame(() => requestAnimationFrame(() => { p.paint = now() - p.t0; finish(p); }));
@@ -624,16 +761,19 @@ const Diag = (() => {
     }
     box.hidden = false;
     const last = presses[presses.length - 1];
-    const slow = presses.filter(p => p.rtt > SLOW || (p.paint || 0) > SLOW);
-    const worst = presses.reduce((m, p) => Math.max(m, p.rtt, p.paint || 0), 0);
+    const felt = p => p.mode === 'local' ? (p.paint || 0) : Math.max(p.rtt, p.paint || 0);   // что увидел участник
+    const slow = presses.filter(p => felt(p) > SLOW);
+    const worst = presses.reduce((m, p) => Math.max(m, felt(p)), 0);
     const ping = pings.length ? pings[pings.length - 1][1] : null, pingMax = pings.length ? pings.reduce((m, x) => Math.max(m, x[1]), 0) : null;
     const gapMax = gaps.length ? gaps.reduce((m, x) => Math.max(m, x[1]), 0) : null;
     const thr = thr0 && thrNow ? `${thrNow.n - thr0.n} раз, ${Math.round(thrNow.ms - thr0.ms)} мс` : 'нет данных';
     box.innerHTML =
       `<b>ДИАГНОСТИКА</b> · ${PAGE === 'screen' ? 'экран' : 'пульт'} · F2 — скрыть\n` +
-      (last ? `Нажатие: ответ <span${slowCls(last.rtt)}>${f(last.rtt)}</span> мс · на экране <span${slowCls(last.paint)}>${f(last.paint)}</span> мс · сервер ${last.srv ?? '—'} мс\n`
+      (last ? (last.mode === 'local'
+              ? `Нажатие: на экране <span${slowCls(last.paint)}>${f(last.paint)}</span> мс · счёт дошёл до сервера за ${f(last.rtt)} мс\n`
+              : `Нажатие: ответ <span${slowCls(last.rtt)}>${f(last.rtt)}</span> мс · на экране <span${slowCls(last.paint)}>${f(last.paint)}</span> мс · сервер ${last.srv ?? '—'} мс\n`)
             : 'Нажатий пока нет — нажмите букву во время раунда\n') +
-      `Последние: ${presses.slice(-12).map(p => `<span${slowCls(Math.max(p.rtt, p.paint || 0))}>${f(Math.max(p.rtt, p.paint || 0))}</span>`).join(' ') || '—'}\n` +
+      `Последние: ${presses.slice(-12).map(p => `<span${slowCls(felt(p))}>${f(felt(p))}</span>`).join(' ') || '—'}\n` +
       `Медленных (&gt;${SLOW} мс): ${slow.length} из ${presses.length}${presses.length ? `, худшее ${f(worst)} мс` : ''}\n` +
       `Связь: пинг ${f(ping)} мс, худший за 30 с <span${slowCls(pingMax)}>${f(pingMax)}</span> мс${socket.connected ? '' : ' · НЕТ СВЯЗИ'}\n` +
       `Кадры: худший разрыв за 5 с <span${slowCls(gapMax)}>${f(gapMax)}</span> мс\n` +
@@ -644,11 +784,15 @@ const Diag = (() => {
   function toggle(){ localOn = !localOn; render(); }
   return {
     toggle,
-    pressed(t0){ if (on()) { pending.push({t0, rtt: null, paint: null}); if (pending.length > 50) pending.shift(); } },
+    pressed(t0, mode){ if (on()) { pending.push({t0, mode, rtt: null, paint: null}); if (pending.length > 50) pending.shift(); } },
+    drawn(t0){                          // местное нажатие: когда новая буква реально нарисована
+      const p = pending.find(x => x.t0 === t0); if (!p) return;
+      p.paint = -1; requestAnimationFrame(() => requestAnimationFrame(() => { p.paint = now() - t0; finish(p); }));
+    },
     answered(t0, r){
       const p = pending.find(x => x.t0 === t0); if (!p) return;
       p.rtt = now() - t0; if (r) { p.srv = r.srv; p.wait = r.wait; p.r = r.r; }
-      if (p.paint === null && !(p.r === 'hit' || p.r === 'miss')) p.paint = undefined;   // без смены экрана
+      if (p.mode === 'relay' && p.paint === null && !(p.r === 'hit' || p.r === 'miss' || p.r === 'sent')) p.paint = undefined;   // без смены экрана
       finish(p); pending = pending.filter(x => !x.done || now() - x.t0 < 3000);
     },
   };
@@ -1161,7 +1305,7 @@ document.addEventListener('keydown', e => {
   if (!Snd.on) Snd.enable().then(on => { if (on) soundBtn.classList.add('off'); });   // первое нажатие включает звук
   if (/^Key[A-Z]$/.test(e.code)) {
     e.preventDefault();
-    // не копим нажатия, пока нет связи: после переподключения они бы засчитались невпопад
+    // экран судит сам: нажатие засчитывается сразу, даже без связи; счёт уйдёт на сервер при переподключении
     pressKey(e.code.slice(3));
   }
 });
