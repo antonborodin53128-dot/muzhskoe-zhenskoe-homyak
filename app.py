@@ -13,8 +13,10 @@
 """
 import os
 import random
+import sys
 import time
 from threading import Lock
+from time import perf_counter
 
 from flask import Flask, render_template_string, request
 from flask_socketio import SocketIO, emit
@@ -42,6 +44,7 @@ state = {
     "letter": None,       # буква, которую сейчас нужно нажать
     "wrong": 0,           # счётчик промахов, чтобы экран знал, когда трясти букву
     "bump": 0,            # счётчик изменений очков
+    "diag": False,        # диагностика задержек на экранах (включается с пульта)
 }
 
 
@@ -70,6 +73,7 @@ def snapshot_locked():
         "letter": state["letter"],
         "wrong": state["wrong"],
         "bump": state["bump"],
+        "diag": state["diag"],
         "prep": PREP_SECONDS,
         "round": ROUND_SECONDS,
         "server_now": time.time(),
@@ -143,27 +147,80 @@ def apply_key_locked(letter, seen=None):
     второй раз, пока новая буква ещё не дошла до экрана), нажатие пропускаем: это не промах."""
     letter = str(letter or "").upper()
     if len(letter) != 1 or letter not in LETTERS:
-        return
+        return "bad"
     player = current_player_locked()
     if not player or phase_locked() != "play":
-        return
+        return "off"
     seen = str(seen or "").upper()
     if seen and seen != state["letter"]:
-        return
+        return "skip"
     if letter == state["letter"]:
         player["score"] += 1
         state["letter"] = pick_letter(letter)
         state["bump"] += 1
+        result = "hit"
     else:
         state["wrong"] += 1
+        result = "miss"
     broadcast_locked()
+    return result
 
 
 @socketio.on("key")
 def on_key(data=None):
+    t0 = perf_counter()
     data = payload(data)
     with lock:
-        apply_key_locked(data.get("letter", ""), data.get("seen"))
+        t1 = perf_counter()
+        result = apply_key_locked(data.get("letter", ""), data.get("seen"))
+    t2 = perf_counter()
+    # ответ клиенту (для диагностики): сколько ждали блокировку и сколько всего занял сервер
+    return {"r": result, "wait": round((t1 - t0) * 1000, 2), "srv": round((t2 - t0) * 1000, 2)}
+
+
+# ---------- диагностика задержек ----------
+
+def cpu_throttle():
+    """Сколько раз и на сколько Render притормаживал процессор сервера (данные контейнера, если доступны)."""
+    for path, unit in (("/sys/fs/cgroup/cpu.stat", 1000.0), ("/sys/fs/cgroup/cpu/cpu.stat", 1e6)):
+        try:
+            with open(path) as f:
+                kv = dict(line.split() for line in f if line.strip())
+            us = kv.get("throttled_usec") if unit == 1000.0 else kv.get("throttled_time")
+            return {"n": int(kv.get("nr_throttled", 0)), "ms": round(int(us or 0) / unit, 1)}
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+@socketio.on("diag_ping")
+def on_diag_ping(data=None):
+    return {"thr": cpu_throttle()}
+
+
+@socketio.on("diag")
+def on_diag(data=None):
+    with lock:
+        state["diag"] = bool(payload(data).get("on"))
+        broadcast_locked()
+
+
+def _num(v, lo=0, hi=600000):
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return None
+    return round(v, 1) if lo <= v <= hi else None
+
+
+@socketio.on("diag_slow")
+def on_diag_slow(data=None):
+    """Медленное нажатие или подвисший кадр — в журнал сервера (виден в логах Render)."""
+    d = payload(data)
+    kind = d.get("kind") if d.get("kind") in ("press", "frame", "ping") else "?"
+    page = d.get("page") if d.get("page") in ("screen", "control") else "?"
+    fields = " ".join(f"{k}={_num(d.get(k))}" for k in ("rtt", "srv", "wait", "paint", "gap", "ping") if _num(d.get(k)) is not None)
+    print(f"HAMSTER_DIAG {kind} page={page} {fields} thr={cpu_throttle()}", file=sys.stderr, flush=True)
 
 
 @socketio.on("score")
@@ -496,9 +553,106 @@ const Bg = (() => {
    сборника передаёт буквы в Хомяка, открытого у него внутри. */
 function pressKey(letter){
   if (!S || !socket.connected || phaseOf(S) !== 'play') return false;
-  socket.emit('key', {letter, seen: S.letter});   // seen: какая буква была на экране в момент нажатия
+  const t0 = performance.now();
+  Diag.pressed(t0);
+  socket.emit('key', {letter, seen: S.letter}, r => Diag.answered(t0, r));   // seen: какая буква была на экране в момент нажатия
   return true;
 }
+
+/* ---------- Диагностика задержек ----------
+   Включается клавишей F2 (на этой странице) или кнопкой «Диагностика» на пульте (сразу на всех экранах).
+   Для каждого нажатия: «ответ» — сколько шёл ответ сервера туда-обратно, «на экране» — когда новая
+   буква реально нарисована, «сервер» — сколько сервер думал. Плюс пинг, плавность кадров и то, сколько
+   Render притормаживал процессор сервера. Медленные случаи уходят в журнал сервера. */
+const Diag = (() => {
+  const PAGE = document.getElementById('sideList') ? 'screen' : 'control';   // таблица справа есть только на экране для гостей
+  const SLOW = 250;
+  let localOn = false, wasOn = false, box = null, lastReport = 0;
+  let presses = [], pending = [], pings = [], gaps = [], thr0 = null, thrNow = null, frameLast = 0;
+  const now = () => performance.now();
+  const on = () => localOn || !!(S && S.diag);
+  function reset(){ presses = []; pending = []; pings = []; gaps = []; thr0 = null; thrNow = null; }
+  function report(d){
+    const t = now(); if (t - lastReport < 400) return; lastReport = t;
+    if (socket.connected) socket.emit('diag_slow', Object.assign({page: PAGE}, d));
+  }
+  function finish(p){
+    if (p.done || p.rtt == null) return;
+    if ((p.r === 'hit' || p.r === 'miss') && (p.paint === null || p.paint < 0)) return;   // ждём, когда кадр нарисуется
+    p.done = true; presses.push(p); if (presses.length > 200) presses.shift();
+    if (p.rtt > SLOW || (p.paint || 0) > SLOW) report({kind: 'press', rtt: p.rtt, srv: p.srv, wait: p.wait, paint: p.paint});
+  }
+  // кадры: большой разрыв между кадрами = экран «подвис» сам
+  (function loop(t){
+    if (frameLast && on() && !document.hidden) {
+      const g = t - frameLast; gaps.push([t, g]);
+      while (gaps.length && t - gaps[0][0] > 5000) gaps.shift();
+      if (g > SLOW) report({kind: 'frame', gap: g});
+    }
+    frameLast = t; requestAnimationFrame(loop);
+  })(0);
+  // связь: пинг раз в 2 секунды
+  setInterval(() => {
+    if (!on() || !socket.connected || document.hidden) return;
+    const t = now();
+    socket.emit('diag_ping', {}, r => {
+      const ms = now() - t; pings.push([now(), ms]);
+      while (pings.length && now() - pings[0][0] > 30000) pings.shift();
+      if (r && r.thr) { if (!thr0) thr0 = r.thr; thrNow = r.thr; }
+      if (ms > 400) report({kind: 'ping', ping: ms});
+    });
+  }, 2000);
+  socket.on('state', () => {             // первый снимок после нажатия — это его результат
+    const p = pending.find(x => x.paint === null && x.r !== 'skip' && x.r !== 'off' && x.r !== 'bad');
+    if (!p) return;
+    p.paint = -1;
+    requestAnimationFrame(() => requestAnimationFrame(() => { p.paint = now() - p.t0; finish(p); }));
+  });
+  const f = v => v == null || v < 0 ? '—' : Math.round(v);
+  const slowCls = v => v > SLOW ? ' style="color:#ff6b6b;font-weight:800"' : '';
+  function render(){
+    const btn = document.getElementById('diagBtn');
+    if (btn && S) btn.textContent = 'Диагностика: ' + (S.diag ? 'вкл' : 'выкл');
+    const isOn = on();
+    if (isOn && !wasOn) reset();
+    wasOn = isOn;
+    if (!isOn) { if (box) box.hidden = true; return; }
+    if (!box) {
+      box = document.createElement('div');
+      box.style.cssText = 'position:fixed;left:12px;bottom:12px;z-index:400;max-width:min(560px,calc(100vw - 24px));padding:10px 12px;border-radius:12px;background:rgba(0,0,0,.78);color:#eaf5ee;font:600 13px/1.45 ui-monospace,Menlo,Consolas,monospace;pointer-events:none;white-space:pre-wrap';
+      document.body.appendChild(box);
+    }
+    box.hidden = false;
+    const last = presses[presses.length - 1];
+    const slow = presses.filter(p => p.rtt > SLOW || (p.paint || 0) > SLOW);
+    const worst = presses.reduce((m, p) => Math.max(m, p.rtt, p.paint || 0), 0);
+    const ping = pings.length ? pings[pings.length - 1][1] : null, pingMax = pings.length ? pings.reduce((m, x) => Math.max(m, x[1]), 0) : null;
+    const gapMax = gaps.length ? gaps.reduce((m, x) => Math.max(m, x[1]), 0) : null;
+    const thr = thr0 && thrNow ? `${thrNow.n - thr0.n} раз, ${Math.round(thrNow.ms - thr0.ms)} мс` : 'нет данных';
+    box.innerHTML =
+      `<b>ДИАГНОСТИКА</b> · ${PAGE === 'screen' ? 'экран' : 'пульт'} · F2 — скрыть\n` +
+      (last ? `Нажатие: ответ <span${slowCls(last.rtt)}>${f(last.rtt)}</span> мс · на экране <span${slowCls(last.paint)}>${f(last.paint)}</span> мс · сервер ${last.srv ?? '—'} мс\n`
+            : 'Нажатий пока нет — нажмите букву во время раунда\n') +
+      `Последние: ${presses.slice(-12).map(p => `<span${slowCls(Math.max(p.rtt, p.paint || 0))}>${f(Math.max(p.rtt, p.paint || 0))}</span>`).join(' ') || '—'}\n` +
+      `Медленных (&gt;${SLOW} мс): ${slow.length} из ${presses.length}${presses.length ? `, худшее ${f(worst)} мс` : ''}\n` +
+      `Связь: пинг ${f(ping)} мс, худший за 30 с <span${slowCls(pingMax)}>${f(pingMax)}</span> мс${socket.connected ? '' : ' · НЕТ СВЯЗИ'}\n` +
+      `Кадры: худший разрыв за 5 с <span${slowCls(gapMax)}>${f(gapMax)}</span> мс\n` +
+      `Render притормаживал сервер: ${thr}`;
+  }
+  setInterval(render, 300);
+  addEventListener('keydown', e => { if (e.code === 'F2' && !e.repeat) { e.preventDefault(); toggle(); } });
+  function toggle(){ localOn = !localOn; render(); }
+  return {
+    toggle,
+    pressed(t0){ if (on()) { pending.push({t0, rtt: null, paint: null}); if (pending.length > 50) pending.shift(); } },
+    answered(t0, r){
+      const p = pending.find(x => x.t0 === t0); if (!p) return;
+      p.rtt = now() - t0; if (r) { p.srv = r.srv; p.wait = r.wait; p.r = r.r; }
+      if (p.paint === null && !(p.r === 'hit' || p.r === 'miss')) p.paint = undefined;   // без смены экрана
+      finish(p); pending = pending.filter(x => !x.done || now() - x.t0 < 3000);
+    },
+  };
+})();
 function esc(v){ return String(v).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function ranking(s){ return s.participants.map((p, i) => ({...p, i})).filter(p => p.done).sort((a, b) => b.score - a.score || a.i - b.i); }
 function pointsWord(n){ const a = n % 10, b = n % 100; if (a === 1 && b !== 11) return 'очко'; if (a >= 2 && a <= 4 && (b < 12 || b > 14)) return 'очка'; return 'очков'; }
@@ -609,6 +763,7 @@ h2{margin:0 0 14px;font-size:17px;font-weight:600;color:var(--mist)}
 
   <div class="spacer"></div>
   <button class="namelink" id="namesToggle" hidden>Имена участников</button>
+  <button class="namelink" id="diagBtn" type="button">Диагностика: выкл</button>
   <button class="btn danger" id="reset" hidden>Сбросить конкурс</button>
 </main>
 <script>{{ client_js|safe }}</script>
@@ -636,6 +791,7 @@ function renderNames(){
 }
 $('nameFields').addEventListener('change', e => { const inp = e.target.closest('input'); if (inp) socket.emit('rename', {index: +inp.dataset.i, name: inp.value}); });
 $('nameFields').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); e.target.blur(); } });
+$('diagBtn').onclick = () => { if (S) socket.emit('diag', {on: !S.diag}); };
 $('reset').onclick = () => { if (confirm('Сбросить конкурс? Все результаты удалятся.')) socket.emit('reset'); };
 
 function act(name, data){ socket.emit(name, data || {}); }
