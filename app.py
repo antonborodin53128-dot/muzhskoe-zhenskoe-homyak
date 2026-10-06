@@ -392,6 +392,17 @@ def control():
     return render_template_string(CONTROL_HTML, base=base_path(), theme_css=THEME_CSS, client_js=CLIENT_JS)
 
 
+def external_key(letter):
+    """Буква с другой страницы сборника (лаунчер, меню) — тем же путём, что и с пульта. Возвращает итог."""
+    with lock:
+        return route_key_locked(letter)
+
+
+def playing():
+    with lock:
+        return phase_locked() == "play"
+
+
 @app.post("/api/key")
 def api_key():
     """Буква с другой страницы сборника (лаунчер, меню, единый экран): там нет своего соединения с Хомяком."""
