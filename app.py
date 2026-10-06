@@ -14,7 +14,10 @@
 import os
 import random
 import time
-from threading import Event, Lock, Thread
+import functools
+import itertools
+import threading
+from threading import Lock
 
 from flask import Flask, render_template_string, request
 from flask_socketio import SocketIO, emit
@@ -23,7 +26,6 @@ PREP_SECONDS = int(os.environ.get("PREP_SECONDS", 5))
 ROUND_SECONDS = int(os.environ.get("ROUND_SECONDS", 30))
 MAX_PARTICIPANTS = 30
 QUEUE_SIZE = 8          # сколько следующих букв заранее известно клиентам — чтобы буква менялась мгновенно
-SYNC_BROADCAST = bool(os.environ.get("SYNC_BROADCAST"))   # только для тестов
 # Латинская O похожа на ноль, поэтому в игре её нет — ни на экране, ни на клавиатуре.
 LETTERS = "ABCDEFGHIJKLMNPQRSTUVWXYZ"
 
@@ -76,36 +78,39 @@ def snapshot_locked():
         "prep": PREP_SECONDS,
         "round": ROUND_SECONDS,
         "server_now": time.time(),
+        "seq": next(_seq),
     }
 
 
-_dirty = Event()
-
-
-def _broadcaster():
-    """Рассылает свежее состояние всем экранам. Работает отдельно от обработчиков и вне блокировки:
-    медленный телефон с плохим вайфаем не тормозит ни приём клавиш, ни остальные экраны,
-    а несколько изменений подряд сливаются в одну рассылку."""
-    while True:
-        _dirty.wait()
-        _dirty.clear()
-        with lock:
-            snap = snapshot_locked()
-        try:
-            socketio.emit("state", snap)
-        except Exception:
-            pass
+_seq = itertools.count(1)
+_out = threading.local()
 
 
 def broadcast_locked():
-    if SYNC_BROADCAST:
-        socketio.emit("state", snapshot_locked())
-    else:
-        _dirty.set()
+    """Готовит рассылку, пока держим блокировку; сама отправка — после неё (см. emits).
+    Номер seq растёт с каждым снимком, чтобы клиент отбрасывал запоздавшие."""
+    if not hasattr(_out, "queue"):
+        _out.queue = []
+    _out.queue.append(snapshot_locked())
 
 
-if not SYNC_BROADCAST:
-    Thread(target=_broadcaster, daemon=True, name="hamster-broadcast").start()
+def flush_broadcast():
+    """Отправка вне блокировки: медленный клиент задерживает только свой обработчик,
+    а приём клавиш и рассылка из других потоков идут своим чередом."""
+    queue, _out.queue = getattr(_out, "queue", []), []
+    for snap in queue[-1:]:          # из нескольких подряд нужен только самый свежий
+        socketio.emit("state", snap)
+
+
+def emits(fn):
+    """Обработчик меняет состояние под блокировкой; рассылаем его результат уже после неё."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            flush_broadcast()
+    return wrapper
 
 
 def current_player_locked():
@@ -154,6 +159,7 @@ def on_sync(data=None):
 
 
 @socketio.on("setup")
+@emits
 def on_setup(data=None):
     try:
         count = int(payload(data).get("count", 4))
@@ -170,6 +176,7 @@ def on_setup(data=None):
 
 
 @socketio.on("start_timer")
+@emits
 def on_start_timer(data=None):
     with lock:
         if phase_locked() == "ready":
@@ -197,12 +204,14 @@ def apply_key_locked(letter):
 
 
 @socketio.on("key")
+@emits
 def on_key(data=None):
     with lock:
         apply_key_locked(payload(data).get("letter", ""))
 
 
 @socketio.on("score")
+@emits
 def on_score(data=None):
     """Ручная поправка очков ведущим."""
     try:
@@ -223,6 +232,7 @@ def on_score(data=None):
 
 
 @socketio.on("replay")
+@emits
 def on_replay(data=None):
     """Переиграть раунд текущего участника (например, время запустили случайно)."""
     with lock:
@@ -235,6 +245,7 @@ def on_replay(data=None):
 
 
 @socketio.on("next")
+@emits
 def on_next(data=None):
     with lock:
         player = current_player_locked()
@@ -250,6 +261,7 @@ def on_next(data=None):
 
 
 @socketio.on("rename")
+@emits
 def on_rename(data=None):
     data = payload(data)
     try:
@@ -264,6 +276,7 @@ def on_rename(data=None):
 
 
 @socketio.on("reset")
+@emits
 def on_reset(data=None):
     with lock:
         state.update(participants=[], current=-1, finished=False, started_at=None, letter=None, queue=[], wrong=0)
@@ -291,6 +304,7 @@ def control():
 
 
 @app.post("/api/key")
+@emits
 def api_key():
     """Буква с другой страницы сборника (лаунчер, меню, единый экран): там нет своего соединения с Хомяком."""
     data = request.get_json(silent=True)
@@ -363,8 +377,10 @@ socket.on('disconnect', () => offlineBar && offlineBar.classList.add('on'));
    Сервер заранее присылает следующие буквы (upcoming). Верная клавиша сразу меняет очки и букву на экране,
    не дожидаясь ответа сервера; потом приходит настоящее состояние и либо совпадает, либо поправляет. */
 const Pred = {on: false, player: -1, score: 0, letter: null, up: [], until: 0, wrong: 0};
-let srvWrong = null;
+let srvWrong = null, lastSeq = null;
+socket.on('connect', () => { lastSeq = null; });                  // после перезапуска сервера нумерация начинается заново
 function applyState(s){
+  if (s.seq != null) { if (lastSeq !== null && s.seq < lastSeq) return; lastSeq = s.seq; }   // запоздавший снимок не откатывает экран
   clockOffset = s.server_now - Date.now() / 1000;
   const now = performance.now(), cur = s.participants[s.current];
   if (srvWrong !== null && s.wrong > srvWrong) Pred.wrong = Math.max(0, Pred.wrong - (s.wrong - srvWrong));   // свой промах уже показан
