@@ -137,13 +137,18 @@ def on_start_timer(data=None):
             broadcast_locked()
 
 
-def apply_key_locked(letter):
-    """Нажатая буква: верная — очко и новая буква, неверная — промах. Вне игры — игнорируется."""
+def apply_key_locked(letter, seen=None):
+    """Нажатая буква: верная — очко и новая буква, неверная — промах. Вне игры — игнорируется.
+    seen — буква, которая была на экране в момент нажатия. Если на сервере уже другая (участник нажал
+    второй раз, пока новая буква ещё не дошла до экрана), нажатие пропускаем: это не промах."""
     letter = str(letter or "").upper()
     if len(letter) != 1 or letter not in LETTERS:
         return
     player = current_player_locked()
     if not player or phase_locked() != "play":
+        return
+    seen = str(seen or "").upper()
+    if seen and seen != state["letter"]:
         return
     if letter == state["letter"]:
         player["score"] += 1
@@ -156,8 +161,9 @@ def apply_key_locked(letter):
 
 @socketio.on("key")
 def on_key(data=None):
+    data = payload(data)
     with lock:
-        apply_key_locked(payload(data).get("letter", ""))
+        apply_key_locked(data.get("letter", ""), data.get("seen"))
 
 
 @socketio.on("score")
@@ -490,7 +496,7 @@ const Bg = (() => {
    сборника передаёт буквы в Хомяка, открытого у него внутри. */
 function pressKey(letter){
   if (!S || !socket.connected || phaseOf(S) !== 'play') return false;
-  socket.emit('key', {letter});
+  socket.emit('key', {letter, seen: S.letter});   // seen: какая буква была на экране в момент нажатия
   return true;
 }
 function esc(v){ return String(v).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
