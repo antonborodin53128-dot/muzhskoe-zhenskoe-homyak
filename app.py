@@ -28,6 +28,10 @@ SYNC_BROADCAST = bool(os.environ.get("SYNC_BROADCAST"))   # только для 
 LETTERS = "ABCDEFGHIJKLMNPQRSTUVWXYZ"
 
 app = Flask(__name__)
+try:   # в общем сборнике: «Правила» в углу пульта и ссылка «Вернуться на страницу конкурсов» внизу; отдельно от сборника rules.py нет
+    import rules; rules.install(app, "hamster")
+except ImportError:
+    pass
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 lock = Lock()
 
@@ -805,6 +809,7 @@ body{background:radial-gradient(60% 70% at 50% 55%,var(--signal-soft),transparen
 /* кнопка звука */
 .sound{position:fixed;right:20px;bottom:20px;z-index:50;border:1px solid var(--line);background:rgba(13,38,27,.9);color:var(--chalk);border-radius:999px;padding:12px 20px;font-weight:600;font-size:16px;cursor:pointer;transition:opacity .4s}
 .sound:hover{border-color:var(--signal)}
+.sound:not(.off){animation:sndlate .4s ease 2.5s both}@keyframes sndlate{from{opacity:0}to{opacity:1}}
 .sound.off{opacity:0;pointer-events:none}
 .who{font-family:var(--display);font-weight:800;font-size:clamp(32px,4.2vw,80px);line-height:1}
 .count{font-size:min(27vw,42vh);line-height:1;color:var(--signal);margin:1.5vh 0 0;filter:drop-shadow(0 0 40px var(--signal-soft))}
