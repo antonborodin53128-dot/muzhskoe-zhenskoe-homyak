@@ -14,7 +14,7 @@
 import os
 import random
 import time
-from threading import Lock
+from threading import Event, Lock, Thread
 
 from flask import Flask, render_template_string, request
 from flask_socketio import SocketIO, emit
@@ -22,6 +22,8 @@ from flask_socketio import SocketIO, emit
 PREP_SECONDS = int(os.environ.get("PREP_SECONDS", 5))
 ROUND_SECONDS = int(os.environ.get("ROUND_SECONDS", 30))
 MAX_PARTICIPANTS = 30
+QUEUE_SIZE = 8          # сколько следующих букв заранее известно клиентам — чтобы буква менялась мгновенно
+SYNC_BROADCAST = bool(os.environ.get("SYNC_BROADCAST"))   # только для тестов
 # Латинская O похожа на ноль, поэтому в игре её нет — ни на экране, ни на клавиатуре.
 LETTERS = "ABCDEFGHIJKLMNPQRSTUVWXYZ"
 
@@ -35,6 +37,7 @@ state = {
     "finished": False,
     "started_at": None,   # момент нажатия «Запустить время»; дальше отсчёт и раунд
     "letter": None,       # буква, которую сейчас нужно нажать
+    "queue": [],          # следующие буквы по порядку (клиент подставляет их сразу, не дожидаясь ответа)
     "wrong": 0,           # счётчик промахов, чтобы экран знал, когда трясти букву
     "bump": 0,            # счётчик изменений очков
 }
@@ -63,6 +66,7 @@ def snapshot_locked():
         "finished": state["finished"],
         "started_at": state["started_at"],
         "letter": state["letter"],
+        "upcoming": list(state["queue"]),
         "wrong": state["wrong"],
         "bump": state["bump"],
         "prep": PREP_SECONDS,
@@ -71,8 +75,33 @@ def snapshot_locked():
     }
 
 
+_dirty = Event()
+
+
+def _broadcaster():
+    """Рассылает свежее состояние всем экранам. Работает отдельно от обработчиков и вне блокировки:
+    медленный телефон с плохим вайфаем не тормозит ни приём клавиш, ни остальные экраны,
+    а несколько изменений подряд сливаются в одну рассылку."""
+    while True:
+        _dirty.wait()
+        _dirty.clear()
+        with lock:
+            snap = snapshot_locked()
+        try:
+            socketio.emit("state", snap)
+        except Exception:
+            pass
+
+
 def broadcast_locked():
-    socketio.emit("state", snapshot_locked())
+    if SYNC_BROADCAST:
+        socketio.emit("state", snapshot_locked())
+    else:
+        _dirty.set()
+
+
+if not SYNC_BROADCAST:
+    Thread(target=_broadcaster, daemon=True, name="hamster-broadcast").start()
 
 
 def current_player_locked():
@@ -90,6 +119,20 @@ def payload(data):
 def pick_letter(previous):
     """Новая буква — всегда не такая же, как предыдущая."""
     return random.choice([c for c in LETTERS if c != previous])
+
+
+def refill_queue_locked():
+    last = state["queue"][-1] if state["queue"] else state["letter"]
+    while len(state["queue"]) < QUEUE_SIZE:
+        last = pick_letter(last)
+        state["queue"].append(last)
+
+
+def next_letter_locked():
+    """Берём следующую букву из заготовленной очереди и дополняем очередь."""
+    refill_queue_locked()
+    state["letter"] = state["queue"].pop(0)
+    refill_queue_locked()
 
 
 # ---------- события от пульта и от клавиатуры ----------
@@ -116,7 +159,7 @@ def on_setup(data=None):
     with lock:
         state.update(
             participants=[{"name": f"Участник {i + 1}", "score": 0, "done": False} for i in range(count)],
-            current=0, finished=False, started_at=None, letter=None, wrong=0,
+            current=0, finished=False, started_at=None, letter=None, queue=[], wrong=0,
         )
         state["bump"] += 1
         broadcast_locked()
@@ -126,7 +169,8 @@ def on_setup(data=None):
 def on_start_timer(data=None):
     with lock:
         if phase_locked() == "ready":
-            state["letter"] = pick_letter(None)
+            state["letter"], state["queue"] = pick_letter(None), []
+            refill_queue_locked()
             state["started_at"] = time.time()
             broadcast_locked()
 
@@ -141,7 +185,7 @@ def apply_key_locked(letter):
         return
     if letter == state["letter"]:
         player["score"] += 1
-        state["letter"] = pick_letter(letter)
+        next_letter_locked()
         state["bump"] += 1
     else:
         state["wrong"] += 1
@@ -181,7 +225,7 @@ def on_replay(data=None):
         player = current_player_locked()
         if player and not state["finished"]:
             player.update(score=0, done=False)
-            state.update(started_at=None, letter=None)
+            state.update(started_at=None, letter=None, queue=[])
             state["bump"] += 1
             broadcast_locked()
 
@@ -197,7 +241,7 @@ def on_next(data=None):
             state["current"] += 1
         else:
             state["finished"] = True
-        state.update(started_at=None, letter=None)
+        state.update(started_at=None, letter=None, queue=[])
         broadcast_locked()
 
 
@@ -218,7 +262,7 @@ def on_rename(data=None):
 @socketio.on("reset")
 def on_reset(data=None):
     with lock:
-        state.update(participants=[], current=-1, finished=False, started_at=None, letter=None, wrong=0)
+        state.update(participants=[], current=-1, finished=False, started_at=None, letter=None, queue=[], wrong=0)
         state["bump"] += 1
         broadcast_locked()
 
@@ -311,7 +355,36 @@ let S = null, clockOffset = 0;
 const offlineBar = document.getElementById('offline');
 socket.on('connect', () => offlineBar && offlineBar.classList.remove('on'));
 socket.on('disconnect', () => offlineBar && offlineBar.classList.add('on'));
-socket.on('state', s => { clockOffset = s.server_now - Date.now() / 1000; S = s; window.onState && window.onState(s); });
+/* ---- Мгновенный отклик на клавишу ----
+   Сервер заранее присылает следующие буквы (upcoming). Верная клавиша сразу меняет очки и букву на экране,
+   не дожидаясь ответа сервера; потом приходит настоящее состояние и либо совпадает, либо поправляет. */
+const Pred = {on: false, player: -1, score: 0, letter: null, up: [], until: 0, wrong: 0};
+let srvWrong = null;
+function applyState(s){
+  clockOffset = s.server_now - Date.now() / 1000;
+  const now = performance.now(), cur = s.participants[s.current];
+  if (srvWrong !== null && s.wrong > srvWrong) Pred.wrong = Math.max(0, Pred.wrong - (s.wrong - srvWrong));   // свой промах уже показан
+  srvWrong = s.wrong;
+  if (now > Pred.until) { Pred.on = false; Pred.wrong = 0; }                       // перестали жать — верим серверу
+  if (Pred.on && cur && s.current === Pred.player && s.started_at != null && cur.score < Pred.score) {
+    cur.score = Pred.score; s.letter = Pred.letter; s.upcoming = Pred.up;           // сервер ещё не успел за нами
+  } else Pred.on = false;
+  s.wrong += Pred.wrong;
+  S = s; window.onState && window.onState(s);
+}
+socket.on('state', applyState);
+function pressKey(letter){
+  if (!S || !socket.connected || phaseOf(S) !== 'play') return false;
+  const p = S.participants[S.current]; if (!p) return false;
+  socket.emit('key', {letter});
+  Pred.until = performance.now() + 1500;
+  if (letter === S.letter) {
+    if (!S.upcoming || !S.upcoming.length) return true;                              // запаса букв нет — подождём сервер
+    p.score++; S.letter = S.upcoming.shift();
+    Object.assign(Pred, {on: true, player: S.current, score: p.score, letter: S.letter, up: S.upcoming});
+  } else { S.wrong++; Pred.wrong++; }
+  return true;
+}
 document.addEventListener('visibilitychange', () => { if (!document.hidden) socket.emit('sync'); });
 function serverNow(){ return Date.now() / 1000 + clockOffset; }
 function phaseOf(s){
@@ -625,7 +698,7 @@ document.addEventListener('keydown', e => {
   if (e.repeat || !S || e.target.closest('input') || e.ctrlKey || e.metaKey || e.altKey) return;
   if (/^Key[A-Z]$/.test(e.code)) {
     e.preventDefault();
-    if (phaseOf(S) === 'play' && socket.connected) socket.emit('key', {letter: e.code.slice(3)});
+    pressKey(e.code.slice(3));
   }
 });
 
@@ -986,7 +1059,7 @@ document.addEventListener('keydown', e => {
   if (/^Key[A-Z]$/.test(e.code)) {
     e.preventDefault();
     // не копим нажатия, пока нет связи: после переподключения они бы засчитались невпопад
-    if (phaseOf(S) === 'play' && socket.connected) socket.emit('key', {letter: e.code.slice(3)});
+    pressKey(e.code.slice(3));
   }
 });
 
