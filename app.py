@@ -14,9 +14,6 @@
 import os
 import random
 import time
-import functools
-import itertools
-import threading
 from threading import Lock
 
 from flask import Flask, render_template_string, request
@@ -25,7 +22,6 @@ from flask_socketio import SocketIO, emit
 PREP_SECONDS = int(os.environ.get("PREP_SECONDS", 5))
 ROUND_SECONDS = int(os.environ.get("ROUND_SECONDS", 30))
 MAX_PARTICIPANTS = 30
-QUEUE_SIZE = 8          # сколько следующих букв заранее известно клиентам — чтобы буква менялась мгновенно
 # Латинская O похожа на ноль, поэтому в игре её нет — ни на экране, ни на клавиатуре.
 LETTERS = "ABCDEFGHIJKLMNPQRSTUVWXYZ"
 
@@ -34,7 +30,8 @@ try:   # в общем сборнике: «Правила» в углу пуль
     import rules; rules.install(app, "hamster")
 except ImportError:
     pass
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+# async_handlers=False: нажатия одного клиента обрабатываются строго в том порядке, в каком нажаты
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading", async_handlers=False)
 lock = Lock()
 
 state = {
@@ -43,7 +40,6 @@ state = {
     "finished": False,
     "started_at": None,   # момент нажатия «Запустить время»; дальше отсчёт и раунд
     "letter": None,       # буква, которую сейчас нужно нажать
-    "queue": [],          # следующие буквы по порядку (клиент подставляет их сразу, не дожидаясь ответа)
     "wrong": 0,           # счётчик промахов, чтобы экран знал, когда трясти букву
     "bump": 0,            # счётчик изменений очков
 }
@@ -72,45 +68,16 @@ def snapshot_locked():
         "finished": state["finished"],
         "started_at": state["started_at"],
         "letter": state["letter"],
-        "upcoming": list(state["queue"]),
         "wrong": state["wrong"],
         "bump": state["bump"],
         "prep": PREP_SECONDS,
         "round": ROUND_SECONDS,
         "server_now": time.time(),
-        "seq": next(_seq),
     }
 
 
-_seq = itertools.count(1)
-_out = threading.local()
-
-
 def broadcast_locked():
-    """Готовит рассылку, пока держим блокировку; сама отправка — после неё (см. emits).
-    Номер seq растёт с каждым снимком, чтобы клиент отбрасывал запоздавшие."""
-    if not hasattr(_out, "queue"):
-        _out.queue = []
-    _out.queue.append(snapshot_locked())
-
-
-def flush_broadcast():
-    """Отправка вне блокировки: медленный клиент задерживает только свой обработчик,
-    а приём клавиш и рассылка из других потоков идут своим чередом."""
-    queue, _out.queue = getattr(_out, "queue", []), []
-    for snap in queue[-1:]:          # из нескольких подряд нужен только самый свежий
-        socketio.emit("state", snap)
-
-
-def emits(fn):
-    """Обработчик меняет состояние под блокировкой; рассылаем его результат уже после неё."""
-    @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
-        try:
-            return fn(*args, **kwargs)
-        finally:
-            flush_broadcast()
-    return wrapper
+    socketio.emit("state", snapshot_locked())
 
 
 def current_player_locked():
@@ -130,19 +97,6 @@ def pick_letter(previous):
     return random.choice([c for c in LETTERS if c != previous])
 
 
-def refill_queue_locked():
-    last = state["queue"][-1] if state["queue"] else state["letter"]
-    while len(state["queue"]) < QUEUE_SIZE:
-        last = pick_letter(last)
-        state["queue"].append(last)
-
-
-def next_letter_locked():
-    """Берём следующую букву из заготовленной очереди и дополняем очередь."""
-    refill_queue_locked()
-    state["letter"] = state["queue"].pop(0)
-    refill_queue_locked()
-
 
 # ---------- события от пульта и от клавиатуры ----------
 
@@ -159,7 +113,6 @@ def on_sync(data=None):
 
 
 @socketio.on("setup")
-@emits
 def on_setup(data=None):
     try:
         count = int(payload(data).get("count", 4))
@@ -169,19 +122,17 @@ def on_setup(data=None):
     with lock:
         state.update(
             participants=[{"name": f"Участник {i + 1}", "score": 0, "done": False} for i in range(count)],
-            current=0, finished=False, started_at=None, letter=None, queue=[], wrong=0,
+            current=0, finished=False, started_at=None, letter=None, wrong=0,
         )
         state["bump"] += 1
         broadcast_locked()
 
 
 @socketio.on("start_timer")
-@emits
 def on_start_timer(data=None):
     with lock:
         if phase_locked() == "ready":
-            state["letter"], state["queue"] = pick_letter(None), []
-            refill_queue_locked()
+            state["letter"] = pick_letter(None)
             state["started_at"] = time.time()
             broadcast_locked()
 
@@ -196,7 +147,7 @@ def apply_key_locked(letter):
         return
     if letter == state["letter"]:
         player["score"] += 1
-        next_letter_locked()
+        state["letter"] = pick_letter(letter)
         state["bump"] += 1
     else:
         state["wrong"] += 1
@@ -204,14 +155,12 @@ def apply_key_locked(letter):
 
 
 @socketio.on("key")
-@emits
 def on_key(data=None):
     with lock:
         apply_key_locked(payload(data).get("letter", ""))
 
 
 @socketio.on("score")
-@emits
 def on_score(data=None):
     """Ручная поправка очков ведущим."""
     try:
@@ -232,20 +181,18 @@ def on_score(data=None):
 
 
 @socketio.on("replay")
-@emits
 def on_replay(data=None):
     """Переиграть раунд текущего участника (например, время запустили случайно)."""
     with lock:
         player = current_player_locked()
         if player and not state["finished"]:
             player.update(score=0, done=False)
-            state.update(started_at=None, letter=None, queue=[])
+            state.update(started_at=None, letter=None)
             state["bump"] += 1
             broadcast_locked()
 
 
 @socketio.on("next")
-@emits
 def on_next(data=None):
     with lock:
         player = current_player_locked()
@@ -256,12 +203,11 @@ def on_next(data=None):
             state["current"] += 1
         else:
             state["finished"] = True
-        state.update(started_at=None, letter=None, queue=[])
+        state.update(started_at=None, letter=None)
         broadcast_locked()
 
 
 @socketio.on("rename")
-@emits
 def on_rename(data=None):
     data = payload(data)
     try:
@@ -276,10 +222,9 @@ def on_rename(data=None):
 
 
 @socketio.on("reset")
-@emits
 def on_reset(data=None):
     with lock:
-        state.update(participants=[], current=-1, finished=False, started_at=None, letter=None, queue=[], wrong=0)
+        state.update(participants=[], current=-1, finished=False, started_at=None, letter=None, wrong=0)
         state["bump"] += 1
         broadcast_locked()
 
@@ -304,7 +249,6 @@ def control():
 
 
 @app.post("/api/key")
-@emits
 def api_key():
     """Буква с другой страницы сборника (лаунчер, меню, единый экран): там нет своего соединения с Хомяком."""
     data = request.get_json(silent=True)
@@ -373,38 +317,7 @@ let S = null, clockOffset = 0;
 const offlineBar = document.getElementById('offline');
 socket.on('connect', () => offlineBar && offlineBar.classList.remove('on'));
 socket.on('disconnect', () => offlineBar && offlineBar.classList.add('on'));
-/* ---- Мгновенный отклик на клавишу ----
-   Сервер заранее присылает следующие буквы (upcoming). Верная клавиша сразу меняет очки и букву на экране,
-   не дожидаясь ответа сервера; потом приходит настоящее состояние и либо совпадает, либо поправляет. */
-const Pred = {on: false, player: -1, score: 0, letter: null, up: [], until: 0, wrong: 0};
-let srvWrong = null, lastSeq = null;
-socket.on('connect', () => { lastSeq = null; });                  // после перезапуска сервера нумерация начинается заново
-function applyState(s){
-  if (s.seq != null) { if (lastSeq !== null && s.seq < lastSeq) return; lastSeq = s.seq; }   // запоздавший снимок не откатывает экран
-  clockOffset = s.server_now - Date.now() / 1000;
-  const now = performance.now(), cur = s.participants[s.current];
-  if (srvWrong !== null && s.wrong > srvWrong) Pred.wrong = Math.max(0, Pred.wrong - (s.wrong - srvWrong));   // свой промах уже показан
-  srvWrong = s.wrong;
-  if (now > Pred.until) { Pred.on = false; Pred.wrong = 0; }                       // перестали жать — верим серверу
-  if (Pred.on && cur && s.current === Pred.player && s.started_at != null && cur.score < Pred.score) {
-    cur.score = Pred.score; s.letter = Pred.letter; s.upcoming = Pred.up;           // сервер ещё не успел за нами
-  } else Pred.on = false;
-  s.wrong += Pred.wrong;
-  S = s; window.onState && window.onState(s);
-}
-socket.on('state', applyState);
-function pressKey(letter){
-  if (!S || !socket.connected || phaseOf(S) !== 'play') return false;
-  const p = S.participants[S.current]; if (!p) return false;
-  socket.emit('key', {letter});
-  Pred.until = performance.now() + 1500;
-  if (letter === S.letter) {
-    if (!S.upcoming || !S.upcoming.length) return true;                              // запаса букв нет — подождём сервер
-    p.score++; S.letter = S.upcoming.shift();
-    Object.assign(Pred, {on: true, player: S.current, score: p.score, letter: S.letter, up: S.upcoming});
-  } else { S.wrong++; Pred.wrong++; }
-  return true;
-}
+socket.on('state', s => { clockOffset = s.server_now - Date.now() / 1000; S = s; window.onState && window.onState(s); });
 document.addEventListener('visibilitychange', () => { if (!document.hidden) socket.emit('sync'); });
 function serverNow(){ return Date.now() / 1000 + clockOffset; }
 function phaseOf(s){
@@ -573,6 +486,13 @@ const Bg = (() => {
   return { pulse(){ flashTarget = 1; }, recolor: readColor };
 })();
 
+/* Нажатие буквы: на сервер по уже открытому соединению. Через эту же функцию единый гостевой экран
+   сборника передаёт буквы в Хомяка, открытого у него внутри. */
+function pressKey(letter){
+  if (!S || !socket.connected || phaseOf(S) !== 'play') return false;
+  socket.emit('key', {letter});
+  return true;
+}
 function esc(v){ return String(v).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function ranking(s){ return s.participants.map((p, i) => ({...p, i})).filter(p => p.done).sort((a, b) => b.score - a.score || a.i - b.i); }
 function pointsWord(n){ const a = n % 10, b = n % 100; if (a === 1 && b !== 11) return 'очко'; if (a >= 2 && a <= 4 && (b < 12 || b > 14)) return 'очка'; return 'очков'; }
