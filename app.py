@@ -131,22 +131,27 @@ def on_start_timer(data=None):
             broadcast_locked()
 
 
-@socketio.on("key")
-def on_key(data=None):
-    letter = str(payload(data).get("letter", "")).upper()
+def apply_key_locked(letter):
+    """Нажатая буква: верная — очко и новая буква, неверная — промах. Вне игры — игнорируется."""
+    letter = str(letter or "").upper()
     if len(letter) != 1 or letter not in LETTERS:
         return
+    player = current_player_locked()
+    if not player or phase_locked() != "play":
+        return
+    if letter == state["letter"]:
+        player["score"] += 1
+        state["letter"] = pick_letter(letter)
+        state["bump"] += 1
+    else:
+        state["wrong"] += 1
+    broadcast_locked()
+
+
+@socketio.on("key")
+def on_key(data=None):
     with lock:
-        player = current_player_locked()
-        if not player or phase_locked() != "play":
-            return
-        if letter == state["letter"]:
-            player["score"] += 1
-            state["letter"] = pick_letter(letter)
-            state["bump"] += 1
-        else:
-            state["wrong"] += 1
-        broadcast_locked()
+        apply_key_locked(payload(data).get("letter", ""))
 
 
 @socketio.on("score")
@@ -235,6 +240,15 @@ def no_cache(resp):
 @app.get("/")
 def control():
     return render_template_string(CONTROL_HTML, base=base_path(), theme_css=THEME_CSS, client_js=CLIENT_JS)
+
+
+@app.post("/api/key")
+def api_key():
+    """Буква с другой страницы сборника (лаунчер, меню, единый экран): там нет своего соединения с Хомяком."""
+    data = request.get_json(silent=True)
+    with lock:
+        apply_key_locked(payload(data).get("letter", ""))
+    return ("", 204)
 
 
 @app.get("/screen")
